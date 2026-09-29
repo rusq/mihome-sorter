@@ -1,0 +1,11 @@
+*.mp4
+*.png
+*.zip
+__pycache__
+*~
+*.PNG
+*.JPG
+*.png
+*.jpg
+.DS_Store
+*.csv
