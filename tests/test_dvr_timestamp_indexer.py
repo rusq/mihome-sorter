@@ -315,6 +315,27 @@ def test_renamer_safe_move_never_overwrites_different_content(tmp_path: Path):
     assert destination.read_bytes() == b"unrelated"
 
 
+def test_renamer_safe_move_refuses_a_destination_created_during_publication(
+    tmp_path: Path, monkeypatch
+):
+    source = tmp_path / "source.mp4"
+    destination = tmp_path / "destination.mp4"
+    source.write_bytes(b"source")
+    original_link = renamer.os.link
+
+    def publish_competing_file(source_name: Path, destination_name: Path) -> None:
+        destination.write_bytes(b"competing")
+        original_link(source_name, destination_name)
+
+    monkeypatch.setattr(renamer.os, "link", publish_competing_file)
+
+    with pytest.raises(RuntimeError, match="refusing to overwrite"):
+        renamer.safe_move(source, destination, renamer.sha256_file(source))
+
+    assert source.read_bytes() == b"source"
+    assert destination.read_bytes() == b"competing"
+
+
 def test_renamer_resumes_after_a_failed_move(tmp_path: Path, monkeypatch):
     root = tmp_path / "source"
     root.mkdir()
