@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Build a read-only CSV index from Xiaomi camera timestamp overlays."""
 
 from __future__ import annotations
