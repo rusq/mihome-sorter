@@ -10,6 +10,8 @@ from dvr_timestamp_indexer import (
     OcrResult,
     crop_overlay,
     index_videos,
+    is_camera_photo,
+    media_paths,
     parse_timestamp,
     preprocessing_variants,
     read_index,
@@ -59,6 +61,58 @@ def test_extract_timestamp_records_first_usable_frame_resolution(monkeypatch, tm
     assert result.status == "ok"
     assert result.resolution == "1920x1080"
     assert resolution_from_frame(Image.new("RGB", (640, 360))) == "640x360"
+
+
+def test_media_paths_include_camera_photos_but_exclude_unrelated_pngs(tmp_path: Path):
+    root = tmp_path / "archive"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    for name in ("z.mp4", "IMG_123.PNG", "img_9.png", "logo.png", "IMG_x.PNG"):
+        (nested / name).touch()
+
+    paths = media_paths(root)
+
+    assert [path.relative_to(root).as_posix() for path in paths] == [
+        "nested/IMG_123.PNG",
+        "nested/img_9.png",
+        "nested/z.mp4",
+    ]
+    assert is_camera_photo(nested / "IMG_123.PNG")
+    assert not is_camera_photo(nested / "IMG_x.PNG")
+
+
+def test_extract_timestamp_loads_camera_png_with_its_native_resolution(monkeypatch, tmp_path: Path):
+    photo = tmp_path / "IMG_123.PNG"
+    Image.new("RGB", (300, 200)).save(photo)
+    monkeypatch.setattr(indexer.shutil, "which", lambda executable: executable)
+    monkeypatch.setattr(
+        indexer,
+        "first_usable_frame",
+        lambda path: pytest.fail("camera PNGs must not use video decoding"),
+    )
+    monkeypatch.setattr(
+        indexer,
+        "_run_tesseract",
+        lambda image, executable: ("2025/10/31 15:04:05", "98.0"),
+    )
+
+    result = indexer.extract_timestamp(photo)
+    recovery = indexer.extract_recovery_timestamp(photo)
+
+    assert result.status == "ok"
+    assert result.resolution == "300x200"
+    assert recovery.status == "ok"
+    assert recovery.resolution == "300x200"
+
+
+def test_extract_timestamp_reports_unreadable_camera_png_as_decode_error(monkeypatch, tmp_path: Path):
+    photo = tmp_path / "IMG_123.PNG"
+    photo.write_bytes(b"not a PNG")
+    monkeypatch.setattr(indexer.shutil, "which", lambda executable: executable)
+
+    result = indexer.extract_timestamp(photo)
+
+    assert result.status == "decode_error"
 
 
 def test_csv_is_sorted_and_retains_failures(tmp_path: Path):
@@ -112,6 +166,22 @@ def test_reprocess_preserves_successes_and_updates_only_blank_rows(tmp_path: Pat
     assert updated[1]["resolution"] == "640x360"
     assert updated[1]["ocr_text"] == "new"
     assert updated[2]["status"] == "missing_file"
+
+
+def test_reprocess_retries_blank_camera_png_rows(tmp_path: Path):
+    root = tmp_path / "archive"
+    root.mkdir()
+    (root / "IMG_123.PNG").touch()
+    rows = [renamer_row("IMG_123.PNG", actual_datetime="", resolution="", status="no_timestamp")]
+
+    updated = reprocess_rows(
+        root,
+        rows,
+        lambda path: OcrResult("2025-10-31 12:00:00", "ok", resolution="1920x1080"),
+    )
+
+    assert updated[0]["actual_datetime"] == "2025-10-31 12:00:00"
+    assert updated[0]["status"] == "ok"
 
 
 def test_reprocess_rejects_unsafe_paths_and_replaces_csv_atomically(tmp_path: Path):
@@ -229,7 +299,7 @@ def test_renamer_requires_exact_index_coverage_and_safe_paths(tmp_path: Path):
     (root / "indexed.mp4").write_bytes(b"indexed")
     (root / "extra.mp4").write_bytes(b"extra")
 
-    with pytest.raises(ValueError, match="unindexed video"):
+    with pytest.raises(ValueError, match="unindexed media"):
         renamer.validate_initial_archive(root, [renamer_row("indexed.mp4")])
     with pytest.raises(ValueError, match="duplicate CSV path"):
         renamer.validate_initial_archive(
@@ -238,6 +308,48 @@ def test_renamer_requires_exact_index_coverage_and_safe_paths(tmp_path: Path):
         )
     with pytest.raises(ValueError, match="escapes input root"):
         renamer.validate_initial_archive(root, [renamer_row("../outside.mp4")])
+
+
+def test_renamer_keeps_png_and_mp4_timestamps_independent(tmp_path: Path):
+    root = tmp_path / "source"
+    root.mkdir()
+    files = {
+        "video.mp4": b"video",
+        "IMG_123.PNG": b"high photo",
+        "IMG_124.PNG": b"low photo",
+        "unrelated.png": b"ignored",
+    }
+    for name, content in files.items():
+        (root / name).write_bytes(content)
+    rows = [
+        renamer_row("video.mp4", resolution="1920x1080"),
+        renamer_row("IMG_123.PNG", resolution="3000x2000"),
+        renamer_row("IMG_124.PNG", resolution="640x360"),
+    ]
+    paths = renamer.validate_initial_archive(root, rows)
+    digests = {name: renamer.sha256_file(path) for name, path in paths.items()}
+
+    plan = renamer.build_plan(root, tmp_path / "output", rows, digests)
+    by_source = {move.source_path: move for move in plan}
+
+    assert by_source["video.mp4"].destination_path.endswith(".mp4")
+    assert by_source["video.mp4"].classification == "canonical"
+    assert by_source["IMG_123.PNG"].destination_path.endswith(".png")
+    assert by_source["IMG_123.PNG"].classification == "canonical"
+    assert by_source["IMG_124.PNG"].destination_path.endswith(".png")
+    assert by_source["IMG_124.PNG"].destination_path.startswith(
+        "_review/lower-resolution/"
+    )
+
+    output = tmp_path / "output"
+    renamer.apply_plan(root, output, rows, plan)
+    assert (output / by_source["video.mp4"].destination_path).is_file()
+    assert (output / by_source["IMG_123.PNG"].destination_path).is_file()
+    assert (output / by_source["IMG_124.PNG"].destination_path).is_file()
+    assert (root / "unrelated.png").read_bytes() == b"ignored"
+    assert {
+        row["file_path"] for row in read_index(output / "index.csv")
+    } == {move.destination_path for move in plan}
 
 
 def test_renamer_rejects_symlinked_sources(tmp_path: Path):

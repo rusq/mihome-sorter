@@ -24,6 +24,7 @@ TIMESTAMP_RE = re.compile(
     r"(?P<year>\d{4})\s*/\s*(?P<month>\d{1,2})\s*/\s*(?P<day>\d{1,2})"
     + r"\s*(?P<hour>\d{1,2})\s*:\s*(?P<minute>\d{1,2})\s*:\s*(?P<second>\d{1,2})"
 )
+CAMERA_PHOTO_RE = re.compile(r"IMG_\d+\.PNG\Z", re.IGNORECASE)
 CSV_FIELDS = (
     "file_path",
     "actual_datetime",
@@ -160,19 +161,41 @@ def first_usable_frame(path: Path, max_frames: int = 10) -> Image.Image:
     raise RuntimeError(f"no usable video frame in first {max_frames} decoded frames")
 
 
+def is_camera_photo(path: Path) -> bool:
+    """Return whether *path* is a Xiaomi camera PNG photo."""
+    return bool(CAMERA_PHOTO_RE.fullmatch(path.name))
+
+
+def is_supported_media_path(path: Path) -> bool:
+    """Return whether *path* is an indexable Xiaomi video or camera photo."""
+    return path.suffix.lower() == ".mp4" or is_camera_photo(path)
+
+
+def first_usable_image(path: Path) -> Image.Image:
+    """Load a camera photo or decode the first usable video frame."""
+    if is_camera_photo(path):
+        try:
+            with Image.open(path) as image:
+                image.load()
+                return image.copy()
+        except OSError as exc:
+            raise RuntimeError(str(exc)) from exc
+    return first_usable_frame(path)
+
+
 def resolution_from_frame(frame: Image.Image) -> str:
     """Return a decoded frame's pixel dimensions in CSV-friendly form."""
     return f"{frame.width}x{frame.height}"
 
 
 def extract_timestamp(path: Path, tesseract: str = "tesseract") -> OcrResult:
-    """OCR a video's Xiaomi overlay, returning reviewable failures rather than guesses."""
+    """OCR a camera media overlay, returning reviewable failures rather than guesses."""
     if shutil.which(tesseract) is None:
         return OcrResult(
             status="ocr_error", error=f"Tesseract executable not found: {tesseract}"
         )
     try:
-        frame = first_usable_frame(path)
+        frame = first_usable_image(path)
     except Exception as exc:
         return OcrResult(status="decode_error", error=str(exc))
     resolution = resolution_from_frame(frame)
@@ -219,7 +242,7 @@ def extract_recovery_timestamp(path: Path, tesseract: str = "tesseract") -> OcrR
             status="ocr_error", error=f"Tesseract executable not found: {tesseract}"
         )
     try:
-        frame = first_usable_frame(path)
+        frame = first_usable_image(path)
     except Exception as exc:
         return OcrResult(status="decode_error", error=str(exc))
     resolution = resolution_from_frame(frame)
@@ -271,11 +294,24 @@ def extract_recovery_timestamp(path: Path, tesseract: str = "tesseract") -> OcrR
 
 
 def video_paths(root: Path) -> list[Path]:
+    """Return MP4 videos below *root* for compatibility with existing callers."""
     return sorted(
         (
             path
             for path in root.rglob("*")
             if path.is_file() and path.suffix.lower() == ".mp4"
+        ),
+        key=lambda path: path.relative_to(root).as_posix().casefold(),
+    )
+
+
+def media_paths(root: Path) -> list[Path]:
+    """Return indexable videos and Xiaomi camera photos below *root*."""
+    return sorted(
+        (
+            path
+            for path in root.rglob("*")
+            if path.is_file() and is_supported_media_path(path)
         ),
         key=lambda path: path.relative_to(root).as_posix().casefold(),
     )
@@ -361,7 +397,7 @@ def reprocess_rows(
         else:
             if not path.is_file():
                 result = OcrResult(
-                    status="missing_file", error="video file does not exist"
+                    status="missing_file", error="media file does not exist"
                 )
             else:
                 result = extractor(path)
@@ -372,7 +408,7 @@ def reprocess_rows(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="OCR Xiaomi video overlays into a read-only CSV index."
+        description="OCR Xiaomi camera media overlays into a read-only CSV index."
     )
     parser.add_argument(
         "input_root", type=Path, help="archive directory to scan recursively"
@@ -416,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"could not reprocess {args.output_csv}: {exc}", file=sys.stderr)
             return 2
     else:
-        paths = video_paths(root)
+        paths = media_paths(root)
         rows = index_videos(
             root, paths, lambda path: extract_timestamp(path, args.tesseract)
         )
@@ -426,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     action = "reprocessed" if args.reprocess else "indexed"
     print(
-        f"{action} {len(rows)} video(s): "
+        f"{action} {len(rows)} media file(s): "
         + ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
     )
     return 0

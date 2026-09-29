@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from dvr_timestamp_indexer import read_index, write_index_atomically
+from dvr_timestamp_indexer import (
+    is_supported_media_path,
+    read_index,
+    write_index_atomically,
+)
 
 MANIFEST_FIELDS = (
     "input_root",
@@ -98,11 +102,11 @@ def parse_resolution(value: str) -> tuple[int, int] | None:
     return int(match["width"]), int(match["height"])
 
 
-def _relative_video_paths(root: Path) -> set[str]:
+def _relative_media_paths(root: Path) -> set[str]:
     return {
         path.relative_to(root).as_posix()
         for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() == ".mp4"
+        if path.is_file() and is_supported_media_path(path)
     }
 
 
@@ -144,11 +148,11 @@ def _validated_source_paths(
         except ValueError:
             errors.append(f"CSV path escapes input root: {name}")
             continue
-        if relative.suffix.lower() != ".mp4":
-            errors.append(f"CSV path is not an MP4: {name}")
+        if not is_supported_media_path(relative):
+            errors.append(f"CSV path is not supported camera media: {name}")
             continue
         if require_all_present and not resolved.is_file():
-            errors.append(f"indexed video is missing: {name}")
+            errors.append(f"indexed media file is missing: {name}")
             continue
         paths[name] = resolved
 
@@ -183,25 +187,27 @@ def validate_roots(input_root: Path, output_root: Path) -> tuple[Path, Path]:
 def validate_initial_archive(
     input_root: Path, rows: list[dict[str, str]]
 ) -> dict[str, Path]:
-    """Require an exact one-row-per-live-MP4 source inventory."""
+    """Require an exact one-row-per-live-camera-media source inventory."""
     paths = _validated_source_paths(input_root, rows, require_all_present=True)
     indexed = set(paths)
-    live = _relative_video_paths(input_root)
+    live = _relative_media_paths(input_root)
     missing = sorted(indexed - live)
     extra = sorted(live - indexed)
-    errors = [*(f"indexed video is missing: {path}" for path in missing)]
-    errors.extend(f"unindexed video exists: {path}" for path in extra)
+    errors = [*(f"indexed media file is missing: {path}" for path in missing)]
+    errors.extend(f"unindexed media file exists: {path}" for path in extra)
     if errors:
         raise ValueError("\n".join(errors))
     return paths
 
 
-def _canonical_destination(timestamp: datetime, ordinal: int | None) -> str:
+def _canonical_destination(
+    timestamp: datetime, ordinal: int | None, media_suffix: str
+) -> str:
     stem = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
-    suffix = f"__{ordinal:02d}" if ordinal is not None else ""
+    ordinal_suffix = f"__{ordinal:02d}" if ordinal is not None else ""
     return (
         f"{timestamp:%Y}/{timestamp:%m}/{timestamp:%d}/"
-        f"{stem}{suffix}.mp4"
+        f"{stem}{ordinal_suffix}{media_suffix}"
     )
 
 
@@ -214,8 +220,9 @@ def _review_destinations(candidates: list[Candidate], classification: str) -> di
         ordered = sorted(members, key=lambda item: item.row["file_path"])
         for number, member in enumerate(ordered, start=1):
             suffix = f"__{number:02d}" if len(ordered) > 1 else ""
+            media_suffix = Path(member.row["file_path"]).suffix.lower()
             destinations[member.row["file_path"]] = (
-                f"_review/{classification}/{digest[:2]}/{digest}{suffix}.mp4"
+                f"_review/{classification}/{digest[:2]}/{digest}{suffix}{media_suffix}"
             )
     return destinations
 
@@ -275,13 +282,14 @@ def build_plan(
                 reason = f"index status is {candidate.row['status'] or 'blank'}"
             classifications[candidate.row["file_path"]] = (classification, reason)
 
-    by_timestamp: dict[datetime, list[Candidate]] = defaultdict(list)
+    by_timestamp: dict[tuple[datetime, str], list[Candidate]] = defaultdict(list)
     for candidate in representatives:
         assert candidate.timestamp is not None
-        by_timestamp[candidate.timestamp].append(candidate)
+        media_suffix = Path(candidate.row["file_path"]).suffix.lower()
+        by_timestamp[(candidate.timestamp, media_suffix)].append(candidate)
 
     destinations: dict[str, str] = {}
-    for timestamp, members in sorted(by_timestamp.items()):
+    for (timestamp, media_suffix), members in sorted(by_timestamp.items()):
         max_pixels = max(
             candidate.dimensions[0] * candidate.dimensions[1]
             for candidate in members
@@ -302,7 +310,7 @@ def build_plan(
         for number, winner in enumerate(winners, start=1):
             ordinal = number if len(winners) > 1 else None
             name = winner.row["file_path"]
-            destinations[name] = _canonical_destination(timestamp, ordinal)
+            destinations[name] = _canonical_destination(timestamp, ordinal, media_suffix)
             classifications[name] = (
                 "canonical",
                 "highest-resolution file for timestamp"
@@ -403,10 +411,10 @@ def load_resume_plan(
         raise ValueError("resume manifest does not match the input index")
 
     _validated_source_paths(input_root, rows, require_all_present=False)
-    extra = _relative_video_paths(input_root) - {move.source_path for move in saved}
+    extra = _relative_media_paths(input_root) - {move.source_path for move in saved}
     if extra:
         raise ValueError(
-            "unindexed video exists during resume: " + ", ".join(sorted(extra))
+            "unindexed media file exists during resume: " + ", ".join(sorted(extra))
         )
     digests = {move.source_path: move.sha256 for move in saved}
     expected = build_plan(input_root, output_root, rows, digests)
@@ -518,7 +526,7 @@ def _print_plan(moves: list[PlannedMove], *, resume: bool = False) -> None:
     counts = Counter(move.classification for move in moves)
     prefix = "resume plan" if resume else "dry-run plan"
     print(
-        f"{prefix}: {len(moves)} video(s): "
+        f"{prefix}: {len(moves)} media file(s): "
         + ", ".join(f"{key}={counts[key]}" for key in sorted(counts))
     )
     for move in moves:
@@ -573,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"could not reorganize archive: {exc}", file=sys.stderr)
         return 2
 
-    print(f"moved {len(moves)} video(s) into {output_root}")
+    print(f"moved {len(moves)} media file(s) into {output_root}")
     return 0
 
 

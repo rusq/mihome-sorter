@@ -1,6 +1,8 @@
 # DVR timestamp indexer
 
-This read-only utility scans Xiaomi Home video downloads and creates a CSV mapping each video to the timestamp displayed in its first usable frame. It does not rename, move, modify, or delete videos.
+This read-only utility scans Xiaomi Home video downloads and saved camera photos, then creates a CSV mapping each media file to the timestamp displayed in its first usable image. It does not rename, move, modify, or delete source media.
+
+It indexes MP4 videos plus camera photos named `IMG_<integer>.PNG` (case-insensitive); unrelated PNG files are ignored.
 
 The expected overlay is the Xiaomi camera form `MI 2025/10/31 15:04:05` in the upper-left corner. The reported time is camera-local, with no timezone conversion. The indexer uses a tight, proportionally scaled upper-left crop so the date line is not diluted by the scene below it.
 
@@ -33,7 +35,7 @@ uv run dvr-timestamp-index . video-timestamps.csv --tesseract /opt/homebrew/bin/
 
 ## Recover blank timestamps
 
-After an initial scan, retry only rows whose `actual_datetime` is blank. This uses tighter, high-scale OCR crops intended for low-resolution (for example, 640×360) videos, leaves already successful rows untouched, and atomically replaces the existing CSV only after the complete update has been written:
+After an initial scan, retry only rows whose `actual_datetime` is blank. This uses tighter, high-scale OCR crops intended for low-resolution (for example, 640×360) media, leaves already successful rows untouched, and atomically replaces the existing CSV only after the complete update has been written:
 
 ```sh
 uv run dvr-timestamp-index . video-timestamps.csv --reprocess
@@ -51,25 +53,27 @@ uv run dvr-timestamp-rename . video-timestamps.csv ../DVR-chronological
 ```
 
 The preview is read-only. It validates that the CSV contains exactly one row for
-every source MP4, calculates SHA-256 checksums, and prints every proposed move.
+every source MP4 and supported camera PNG, calculates SHA-256 checksums, and prints every proposed move.
 Apply the reviewed plan explicitly:
 
 ```sh
 uv run dvr-timestamp-rename . video-timestamps.csv ../DVR-chronological --apply
 ```
 
-Canonical videos use `YYYY/MM/DD/YYYY-MM-DD_HH-MM-SS.mp4`. When multiple
-non-identical videos have the same timestamp and highest resolution, all are
-kept with deterministic `__01`, `__02`, and later suffixes. Lower-resolution
-same-second files, exact duplicate copies, unresolved rows, and conflicting
-metadata are retained below `_review/`; the command never deletes them.
+Canonical media use `YYYY/MM/DD/YYYY-MM-DD_HH-MM-SS.<extension>`. When multiple
+non-identical files of the same media type have the same timestamp and highest
+resolution, all are kept with deterministic `__01`, `__02`, and later suffixes.
+MP4s and PNGs are compared independently, so a photo cannot displace a video
+(or vice versa). Lower-resolution same-second files, exact duplicate copies,
+unresolved rows, and conflicting metadata are retained below `_review/`; the
+command never deletes them.
 
 The destination receives `reorganization-manifest.csv`, which records every
 original path, destination, checksum, classification, and move state. It is
 updated after every move so the same command can resume an interrupted run.
 Once all moves finish, destination `index.csv` contains the updated relative
 paths. Keep the original CSV until the operation has completed and the new
-archive has been verified. Existing source directories and non-video files are
+archive has been verified. Existing source directories and unsupported files are
 left untouched.
 
 ## Development checks
