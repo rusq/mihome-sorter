@@ -41,6 +41,37 @@ uv run dvr-timestamp-index . video-timestamps.csv --reprocess
 
 The retry still does not infer dates from paths or filenames. Rows without a unique supported OCR result remain blank with an `ambiguous` or failure status for manual review.
 
+## Reorganize an indexed archive
+
+After reviewing the completed index, preview a chronological reorganization into
+a separate destination root:
+
+```sh
+uv run dvr-timestamp-rename . video-timestamps.csv ../DVR-chronological
+```
+
+The preview is read-only. It validates that the CSV contains exactly one row for
+every source MP4, calculates SHA-256 checksums, and prints every proposed move.
+Apply the reviewed plan explicitly:
+
+```sh
+uv run dvr-timestamp-rename . video-timestamps.csv ../DVR-chronological --apply
+```
+
+Canonical videos use `YYYY/MM/DD/YYYY-MM-DD_HH-MM-SS.mp4`. When multiple
+non-identical videos have the same timestamp and highest resolution, all are
+kept with deterministic `__01`, `__02`, and later suffixes. Lower-resolution
+same-second files, exact duplicate copies, unresolved rows, and conflicting
+metadata are retained below `_review/`; the command never deletes them.
+
+The destination receives `reorganization-manifest.csv`, which records every
+original path, destination, checksum, classification, and move state. It is
+updated after every move so the same command can resume an interrupted run.
+Once all moves finish, destination `index.csv` contains the updated relative
+paths. Keep the original CSV until the operation has completed and the new
+archive has been verified. Existing source directories and non-video files are
+left untouched.
+
 ## Development checks
 
 ```sh

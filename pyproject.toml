@@ -13,6 +13,7 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 dvr-timestamp-index = "dvr_timestamp_indexer:main"
+dvr-timestamp-rename = "dvr_timestamp_renamer:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
