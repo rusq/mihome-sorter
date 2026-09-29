@@ -17,7 +17,7 @@ From this directory:
 uv run dvr-timestamp-index . video-timestamps.csv
 ```
 
-The output begins with exactly `file_path,actual_datetime`; paths are relative to the scanned directory and times use `YYYY-MM-DD HH:MM:SS`. Extra diagnostic columns keep OCR evidence and failures reviewable.
+The output begins with exactly `file_path,actual_datetime,resolution,status`; paths are relative to the scanned directory, times use `YYYY-MM-DD HH:MM:SS`, and resolution is the first usable decoded frame's pixel dimensions (for example, `1920x1080`). Extra diagnostic columns keep OCR evidence and failures reviewable.
 
 Before using it to rename files, review rows whose `status` is not `ok`:
 

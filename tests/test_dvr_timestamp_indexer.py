@@ -1,10 +1,9 @@
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
-import csv
-
-import pytest
+import dvr_timestamp_indexer as indexer
 from dvr_timestamp_indexer import (
     CSV_FIELDS,
     OcrResult,
@@ -15,6 +14,7 @@ from dvr_timestamp_indexer import (
     read_index,
     recovery_preprocessing_variants,
     reprocess_rows,
+    resolution_from_frame,
     resolve_index_path,
     video_paths,
     write_index,
@@ -46,6 +46,20 @@ def test_crop_and_preprocessing_scale_with_resolution():
         assert recovery["tight_4x_grayscale"].size == (round(dimensions[0] * 0.27) * 4, round(dimensions[1] * 0.09) * 4)
 
 
+def test_extract_timestamp_records_first_usable_frame_resolution(monkeypatch, tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    video.touch()
+    monkeypatch.setattr(indexer.shutil, "which", lambda executable: executable)
+    monkeypatch.setattr(indexer, "first_usable_frame", lambda path: Image.new("RGB", (1920, 1080)))
+    monkeypatch.setattr(indexer, "_run_tesseract", lambda image, executable: ("2025/10/31 15:04:05", "98.0"))
+
+    result = indexer.extract_timestamp(video)
+
+    assert result.status == "ok"
+    assert result.resolution == "1920x1080"
+    assert resolution_from_frame(Image.new("RGB", (640, 360))) == "640x360"
+
+
 def test_csv_is_sorted_and_retains_failures(tmp_path: Path):
     root = tmp_path / "archive"
     (root / "nested").mkdir(parents=True)
@@ -56,16 +70,22 @@ def test_csv_is_sorted_and_retains_failures(tmp_path: Path):
 
     def fake_extractor(path: Path) -> OcrResult:
         if path == first:
-            return OcrResult("2025-10-31 15:04:05", "ok", "2025/10/31 15:04:05", "98.0")
+            return OcrResult(
+                "2025-10-31 15:04:05",
+                "ok",
+                "2025/10/31 15:04:05",
+                "98.0",
+                resolution="1920x1080",
+            )
         return OcrResult(status="decode_error", error="invalid data")
 
     rows = index_videos(root, video_paths(root), fake_extractor)
     output = tmp_path / "index.csv"
     write_index(output, rows)
     assert output.read_text(encoding="utf-8").splitlines() == [
-        "file_path,actual_datetime,status,ocr_text,confidence,error",
-        "nested/a.mp4,2025-10-31 15:04:05,ok,2025/10/31 15:04:05,98.0,",
-        "z.mp4,,decode_error,,,invalid data",
+        "file_path,actual_datetime,resolution,status,ocr_text,confidence,error",
+        "nested/a.mp4,2025-10-31 15:04:05,1920x1080,ok,2025/10/31 15:04:05,98.0,",
+        "z.mp4,,,decode_error,,,invalid data",
     ]
 
 
@@ -74,14 +94,21 @@ def test_reprocess_preserves_successes_and_updates_only_blank_rows(tmp_path: Pat
     root.mkdir()
     (root / "retry.mp4").touch()
     rows = [
-        {"file_path": "ok.mp4", "actual_datetime": "2025-10-31 15:04:05", "status": "ok", "ocr_text": "original", "confidence": "99.0", "error": ""},
-        {"file_path": "retry.mp4", "actual_datetime": "", "status": "no_timestamp", "ocr_text": "old", "confidence": "", "error": ""},
-        {"file_path": "gone.mp4", "actual_datetime": "", "status": "no_timestamp", "ocr_text": "old", "confidence": "", "error": ""},
+        {"file_path": "ok.mp4", "actual_datetime": "2025-10-31 15:04:05", "resolution": "1920x1080", "status": "ok", "ocr_text": "original", "confidence": "99.0", "error": ""},
+        {"file_path": "retry.mp4", "actual_datetime": "", "resolution": "", "status": "no_timestamp", "ocr_text": "old", "confidence": "", "error": ""},
+        {"file_path": "gone.mp4", "actual_datetime": "", "resolution": "", "status": "no_timestamp", "ocr_text": "old", "confidence": "", "error": ""},
     ]
 
-    updated = reprocess_rows(root, rows, lambda path: OcrResult("2025-10-31 12:00:00", "ok", "new", "90.0"))
+    updated = reprocess_rows(
+        root,
+        rows,
+        lambda path: OcrResult(
+            "2025-10-31 12:00:00", "ok", "new", "90.0", resolution="640x360"
+        ),
+    )
     assert updated[0] == rows[0]
     assert updated[1]["actual_datetime"] == "2025-10-31 12:00:00"
+    assert updated[1]["resolution"] == "640x360"
     assert updated[1]["ocr_text"] == "new"
     assert updated[2]["status"] == "missing_file"
 

@@ -27,6 +27,7 @@ TIMESTAMP_RE = re.compile(
 CSV_FIELDS = (
     "file_path",
     "actual_datetime",
+    "resolution",
     "status",
     "ocr_text",
     "confidence",
@@ -41,6 +42,7 @@ class OcrResult:
     ocr_text: str = ""
     confidence: str = ""
     error: str = ""
+    resolution: str = ""
 
 
 def parse_timestamp(text: str) -> str | None:
@@ -158,6 +160,11 @@ def first_usable_frame(path: Path, max_frames: int = 10) -> Image.Image:
     raise RuntimeError(f"no usable video frame in first {max_frames} decoded frames")
 
 
+def resolution_from_frame(frame: Image.Image) -> str:
+    """Return a decoded frame's pixel dimensions in CSV-friendly form."""
+    return f"{frame.width}x{frame.height}"
+
+
 def extract_timestamp(path: Path, tesseract: str = "tesseract") -> OcrResult:
     """OCR a video's Xiaomi overlay, returning reviewable failures rather than guesses."""
     if shutil.which(tesseract) is None:
@@ -168,6 +175,7 @@ def extract_timestamp(path: Path, tesseract: str = "tesseract") -> OcrResult:
         frame = first_usable_frame(path)
     except Exception as exc:
         return OcrResult(status="decode_error", error=str(exc))
+    resolution = resolution_from_frame(frame)
 
     candidates: dict[str, tuple[str, str]] = {}
     texts: list[str] = []
@@ -186,16 +194,22 @@ def extract_timestamp(path: Path, tesseract: str = "tesseract") -> OcrResult:
     ocr_text = " | ".join(texts)
     if len(candidates) == 1:
         timestamp, (_, confidence) = next(iter(candidates.items()))
-        return OcrResult(timestamp, "ok", ocr_text, confidence)
+        return OcrResult(timestamp, "ok", ocr_text, confidence, resolution=resolution)
     if len(candidates) > 1:
         return OcrResult(
             status="ambiguous",
             ocr_text=ocr_text,
             error="conflicting timestamps: " + ", ".join(sorted(candidates)),
+            resolution=resolution,
         )
     if errors and not texts:
-        return OcrResult(status="ocr_error", error="; ".join(errors))
-    return OcrResult(status="no_timestamp", ocr_text=ocr_text, error="; ".join(errors))
+        return OcrResult(status="ocr_error", error="; ".join(errors), resolution=resolution)
+    return OcrResult(
+        status="no_timestamp",
+        ocr_text=ocr_text,
+        error="; ".join(errors),
+        resolution=resolution,
+    )
 
 
 def extract_recovery_timestamp(path: Path, tesseract: str = "tesseract") -> OcrResult:
@@ -208,6 +222,7 @@ def extract_recovery_timestamp(path: Path, tesseract: str = "tesseract") -> OcrR
         frame = first_usable_frame(path)
     except Exception as exc:
         return OcrResult(status="decode_error", error=str(exc))
+    resolution = resolution_from_frame(frame)
 
     candidates: dict[str, list[tuple[str, str]]] = {}
     texts: list[str] = []
@@ -233,7 +248,9 @@ def extract_recovery_timestamp(path: Path, tesseract: str = "tesseract") -> OcrR
             confidence = (
                 f"{sum(confidences) / len(confidences):.1f}" if confidences else ""
             )
-            return OcrResult(timestamp, "ok", ocr_text, confidence)
+            return OcrResult(
+                timestamp, "ok", ocr_text, confidence, resolution=resolution
+            )
         candidate_summary = ", ".join(
             f"{value} ({len(value_votes)} votes)" for value, value_votes in ranked
         )
@@ -241,10 +258,16 @@ def extract_recovery_timestamp(path: Path, tesseract: str = "tesseract") -> OcrR
             status="ambiguous",
             ocr_text=ocr_text,
             error="unsupported or tied timestamps: " + candidate_summary,
+            resolution=resolution,
         )
     if errors and not texts:
-        return OcrResult(status="ocr_error", error="; ".join(errors))
-    return OcrResult(status="no_timestamp", ocr_text=ocr_text, error="; ".join(errors))
+        return OcrResult(status="ocr_error", error="; ".join(errors), resolution=resolution)
+    return OcrResult(
+        status="no_timestamp",
+        ocr_text=ocr_text,
+        error="; ".join(errors),
+        resolution=resolution,
+    )
 
 
 def video_paths(root: Path) -> list[Path]:
