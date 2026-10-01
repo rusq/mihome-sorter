@@ -13,9 +13,11 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 import av
 from PIL import Image, ImageFilter, ImageOps
@@ -44,6 +46,37 @@ class OcrResult:
     confidence: str = ""
     error: str = ""
     resolution: str = ""
+
+
+class ProgressReporter:
+    """Write synchronized, line-oriented progress updates to a text stream."""
+
+    def __init__(self, total: int, stream: io.TextIOBase | None = None) -> None:
+        self.total = total
+        self.stream = stream if stream is not None else sys.stderr
+        self._started = 0
+        self._completed = 0
+        self._lock = Lock()
+
+    def processing(self, file_path: str) -> None:
+        """Report that a worker has begun OCR for one media file."""
+        with self._lock:
+            self._started += 1
+            print(
+                f"processing [{self._started}/{self.total}] {file_path}",
+                file=self.stream,
+                flush=True,
+            )
+
+    def completed(self, file_path: str, status: str) -> None:
+        """Report the terminal OCR status for one media file."""
+        with self._lock:
+            self._completed += 1
+            print(
+                f"completed [{self._completed}/{self.total}] {file_path}: {status}",
+                file=self.stream,
+                flush=True,
+            )
 
 
 def parse_timestamp(text: str) -> str | None:
@@ -317,16 +350,46 @@ def media_paths(root: Path) -> list[Path]:
     )
 
 
+def _extract_with_progress(
+    path: Path,
+    file_path: str,
+    extractor: Callable[[Path], OcrResult],
+    progress: ProgressReporter | None,
+) -> OcrResult:
+    if progress:
+        progress.processing(file_path)
+    try:
+        result = extractor(path)
+    except Exception:
+        if progress:
+            progress.completed(file_path, "error")
+        raise
+    if progress:
+        progress.completed(file_path, result.status)
+    return result
+
+
 def index_videos(
     root: Path,
     paths: Iterable[Path],
     extractor: Callable[[Path], OcrResult] = extract_timestamp,
+    workers: int = 8,
+    progress: ProgressReporter | None = None,
 ) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for path in paths:
-        result = extractor(path)
-        rows.append({"file_path": path.relative_to(root).as_posix(), **result.__dict__})
-    return rows
+    """Extract timestamps concurrently while retaining the input path order."""
+    paths = list(paths)
+    file_paths = [path.relative_to(root).as_posix() for path in paths]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(
+            executor.map(
+                lambda item: _extract_with_progress(*item, extractor, progress),
+                zip(paths, file_paths),
+            )
+        )
+    return [
+        {"file_path": file_path, **result.__dict__}
+        for file_path, result in zip(file_paths, results)
+    ]
 
 
 def write_index(output: Path, rows: Iterable[dict[str, str]]) -> None:
@@ -382,13 +445,14 @@ def reprocess_rows(
     root: Path,
     rows: Iterable[dict[str, str]],
     extractor: Callable[[Path], OcrResult] = extract_recovery_timestamp,
+    workers: int = 8,
+    progress: ProgressReporter | None = None,
 ) -> list[dict[str, str]]:
     """Retry only index rows that still have no authoritative timestamp."""
-    updated_rows: list[dict[str, str]] = []
-    for row in rows:
-        updated = dict(row)
+    updated_rows = [dict(row) for row in rows]
+    jobs: list[tuple[int, Path, str]] = []
+    for index, updated in enumerate(updated_rows):
         if updated["actual_datetime"]:
-            updated_rows.append(updated)
             continue
         try:
             path = resolve_index_path(root, updated["file_path"])
@@ -400,10 +464,30 @@ def reprocess_rows(
                     status="missing_file", error="media file does not exist"
                 )
             else:
-                result = extractor(path)
+                jobs.append((index, path, updated["file_path"]))
+                continue
         updated.update(result.__dict__)
-        updated_rows.append(updated)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(
+            executor.map(
+                lambda job: _extract_with_progress(
+                    job[1], job[2], extractor, progress
+                ),
+                jobs,
+            )
+        )
+    for (index, _, _), result in zip(jobs, results):
+        updated_rows[index].update(result.__dict__)
     return updated_rows
+
+
+def positive_worker_count(value: str) -> int:
+    """Parse a strictly positive worker count for argparse."""
+    workers = int(value)
+    if workers <= 0:
+        raise argparse.ArgumentTypeError("workers must be a positive integer")
+    return workers
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -424,6 +508,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="retry blank timestamps from the existing output CSV in place",
     )
+    parser.add_argument(
+        "--workers",
+        type=positive_worker_count,
+        default=8,
+        metavar="N",
+        help="number of concurrent OCR workers (default: 8)",
+    )
     return parser
 
 
@@ -442,10 +533,25 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             existing_rows = read_index(args.output_csv)
+            jobs = 0
+            for row in existing_rows:
+                if row["actual_datetime"]:
+                    continue
+                try:
+                    path = resolve_index_path(root, row["file_path"])
+                except ValueError:
+                    continue
+                jobs += path.is_file()
+            print(
+                f"reprocessing {jobs} media file(s) with {args.workers} worker(s)",
+                file=sys.stderr,
+            )
             rows = reprocess_rows(
                 root,
                 existing_rows,
                 lambda path: extract_recovery_timestamp(path, args.tesseract),
+                args.workers,
+                ProgressReporter(jobs),
             )
             write_index_atomically(args.output_csv, rows)
         except (OSError, ValueError, csv.Error) as exc:
@@ -453,8 +559,16 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     else:
         paths = media_paths(root)
+        print(
+            f"indexing {len(paths)} media file(s) with {args.workers} worker(s)",
+            file=sys.stderr,
+        )
         rows = index_videos(
-            root, paths, lambda path: extract_timestamp(path, args.tesseract)
+            root,
+            paths,
+            lambda path: extract_timestamp(path, args.tesseract),
+            args.workers,
+            ProgressReporter(len(paths)),
         )
         write_index(args.output_csv, rows)
     counts: dict[str, int] = {}

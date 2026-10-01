@@ -21,6 +21,15 @@ uv run dvr-timestamp-index . video-timestamps.csv
 
 The output begins with exactly `file_path,actual_datetime,resolution,status`; paths are relative to the scanned directory, times use `YYYY-MM-DD HH:MM:SS`, and resolution is the first usable decoded frame's pixel dimensions (for example, `1920x1080`). Extra diagnostic columns keep OCR evidence and failures reviewable.
 
+The indexer uses eight OCR workers by default. It writes a startup message plus
+line-oriented `processing` and `completed` updates to stderr, so its CSV output
+and final summary remain easy to capture separately. Lower the concurrency for
+a slow disk, or raise it when the machine has capacity:
+
+```sh
+uv run dvr-timestamp-index . video-timestamps.csv --workers 4
+```
+
 Before using it to rename files, review rows whose `status` is not `ok`:
 
 ```sh
@@ -42,6 +51,8 @@ uv run dvr-timestamp-index . video-timestamps.csv --reprocess
 ```
 
 The retry still does not infer dates from paths or filenames. Rows without a unique supported OCR result remain blank with an `ambiguous` or failure status for manual review.
+Recovery uses the same default worker pool and stderr progress messages, but
+only queues existing media whose timestamp is still blank.
 
 ## Reorganize an indexed archive
 

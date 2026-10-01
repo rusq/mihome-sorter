@@ -1,3 +1,4 @@
+import io
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import dvr_timestamp_renamer as renamer
 from dvr_timestamp_indexer import (
     CSV_FIELDS,
     OcrResult,
+    ProgressReporter,
     crop_overlay,
     index_videos,
     is_camera_photo,
@@ -144,6 +146,35 @@ def test_csv_is_sorted_and_retains_failures(tmp_path: Path):
     ]
 
 
+def test_parallel_indexing_retains_path_order_and_reports_progress(tmp_path: Path):
+    root = tmp_path / "archive"
+    root.mkdir()
+    first = root / "a.mp4"
+    second = root / "b.mp4"
+    first.touch()
+    second.touch()
+    stream = io.StringIO()
+
+    rows = index_videos(
+        root,
+        [first, second],
+        lambda path: OcrResult(status="ok" if path == first else "no_timestamp"),
+        workers=2,
+        progress=ProgressReporter(2, stream),
+    )
+
+    assert [row["file_path"] for row in rows] == ["a.mp4", "b.mp4"]
+    updates = stream.getvalue().splitlines()
+    assert {line.rsplit(": ", 1)[-1] for line in updates if line.startswith("completed")} == {
+        "ok",
+        "no_timestamp",
+    }
+    assert {line.split("] ", 1)[-1] for line in updates if line.startswith("processing")} == {
+        "a.mp4",
+        "b.mp4",
+    }
+
+
 def test_reprocess_preserves_successes_and_updates_only_blank_rows(tmp_path: Path):
     root = tmp_path / "archive"
     root.mkdir()
@@ -182,6 +213,70 @@ def test_reprocess_retries_blank_camera_png_rows(tmp_path: Path):
 
     assert updated[0]["actual_datetime"] == "2025-10-31 12:00:00"
     assert updated[0]["status"] == "ok"
+
+
+def test_parallel_reprocess_only_queues_existing_blank_media(tmp_path: Path):
+    root = tmp_path / "archive"
+    root.mkdir()
+    (root / "retry.mp4").touch()
+    rows = [
+        renamer_row("already-indexed.mp4"),
+        renamer_row("retry.mp4", actual_datetime="", resolution="", status="no_timestamp"),
+        renamer_row("missing.mp4", actual_datetime="", resolution="", status="no_timestamp"),
+        renamer_row("../unsafe.mp4", actual_datetime="", resolution="", status="no_timestamp"),
+    ]
+    seen: list[Path] = []
+    stream = io.StringIO()
+
+    updated = reprocess_rows(
+        root,
+        rows,
+        lambda path: seen.append(path) or OcrResult("2025-10-31 12:00:00", "ok"),
+        workers=2,
+        progress=ProgressReporter(1, stream),
+    )
+
+    assert seen == [root / "retry.mp4"]
+    assert [row["status"] for row in updated] == [
+        "ok",
+        "ok",
+        "missing_file",
+        "invalid_path",
+    ]
+    assert "processing [1/1] retry.mp4" in stream.getvalue()
+    assert "completed [1/1] retry.mp4: ok" in stream.getvalue()
+
+
+def test_workers_argument_defaults_to_eight_and_rejects_non_positive_values(capsys):
+    parser = indexer.build_parser()
+
+    assert parser.parse_args(["archive", "index.csv"]).workers == 8
+    assert parser.parse_args(["archive", "index.csv", "--workers", "3"]).workers == 3
+    with pytest.raises(SystemExit):
+        parser.parse_args(["archive", "index.csv", "--workers", "0"])
+    assert "workers must be a positive integer" in capsys.readouterr().err
+
+
+def test_main_reports_index_progress_on_stderr_and_summary_on_stdout(
+    monkeypatch, tmp_path: Path, capsys
+):
+    root = tmp_path / "archive"
+    root.mkdir()
+    (root / "video.mp4").touch()
+    output = tmp_path / "index.csv"
+    monkeypatch.setattr(
+        indexer,
+        "extract_timestamp",
+        lambda path, tesseract: OcrResult("2025-10-31 15:04:05", "ok"),
+    )
+
+    assert indexer.main([str(root), str(output), "--workers", "1"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "indexed 1 media file(s): ok=1\n"
+    assert "indexing 1 media file(s) with 1 worker(s)" in captured.err
+    assert "processing [1/1] video.mp4" in captured.err
+    assert "completed [1/1] video.mp4: ok" in captured.err
 
 
 def test_reprocess_rejects_unsafe_paths_and_replaces_csv_atomically(tmp_path: Path):
