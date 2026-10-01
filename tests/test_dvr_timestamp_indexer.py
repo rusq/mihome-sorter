@@ -1,3 +1,4 @@
+import errno
 import io
 from pathlib import Path
 
@@ -489,6 +490,100 @@ def test_renamer_dry_run_does_not_create_destination(tmp_path: Path):
     assert (root / "video.mp4").read_bytes() == b"video"
 
 
+def test_renamer_prepare_writes_planned_manifest_and_hash_progress(
+    tmp_path: Path, capsys
+):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "video.mp4").write_bytes(b"video")
+    index = tmp_path / "source-index.csv"
+    write_index(index, [renamer_row("video.mp4")])
+    output = tmp_path / "output"
+
+    assert renamer.main([str(root), str(index), str(output), "--prepare"]) == 0
+
+    manifest = renamer.read_manifest(output / renamer.MANIFEST_NAME)
+    assert manifest[0].move_status == "planned"
+    assert not (output / "index.csv").exists()
+    assert not (output / manifest[0].destination_path).exists()
+    assert (root / "video.mp4").read_bytes() == b"video"
+    captured = capsys.readouterr()
+    assert "preparing 1 media file(s) for hashing" in captured.err
+    assert "hashing [1/1] video.mp4" in captured.err
+    assert "hashed [1/1] video.mp4" in captured.err
+    assert "dry-run plan: 1 media file(s)" in captured.out
+    assert "prepared 1 media file(s) at" in captured.out
+
+
+def test_renamer_prepare_manifest_reuses_hashes_when_applying(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "video.mp4").write_bytes(b"video")
+    index = tmp_path / "source-index.csv"
+    write_index(index, [renamer_row("video.mp4")])
+    output = tmp_path / "output"
+    original_sha256_file = renamer.sha256_file
+    hashed_paths: list[Path] = []
+
+    def record_hash(path: Path) -> str:
+        hashed_paths.append(path)
+        return original_sha256_file(path)
+
+    monkeypatch.setattr(renamer, "sha256_file", record_hash)
+    assert renamer.main([str(root), str(index), str(output), "--prepare"]) == 0
+    assert hashed_paths == [root / "video.mp4"]
+
+    hashed_paths.clear()
+    assert renamer.main([str(root), str(index), str(output), "--apply"]) == 0
+    assert hashed_paths == [root / "video.mp4"]
+
+
+def test_renamer_prepared_manifest_rejects_changed_index_or_source(
+    tmp_path: Path, capsys
+):
+    root = tmp_path / "source"
+    root.mkdir()
+    source = root / "video.mp4"
+    source.write_bytes(b"video")
+    index = tmp_path / "source-index.csv"
+    write_index(index, [renamer_row("video.mp4")])
+    output = tmp_path / "output"
+
+    assert renamer.main([str(root), str(index), str(output), "--prepare"]) == 0
+    write_index(
+        index,
+        [renamer_row("video.mp4", actual_datetime="2025-11-20 14:23:06")],
+    )
+    assert renamer.main([str(root), str(index), str(output), "--apply"]) == 2
+    assert "does not match current index" in capsys.readouterr().err
+
+    write_index(index, [renamer_row("video.mp4")])
+    source.write_bytes(b"changed")
+    assert renamer.main([str(root), str(index), str(output), "--apply"]) == 2
+    assert "source content changed" in capsys.readouterr().err
+    assert source.read_bytes() == b"changed"
+
+
+def test_renamer_prepare_rejects_existing_manifest_and_apply_combination(
+    tmp_path: Path, capsys
+):
+    parser = renamer.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["source", "index.csv", "output", "--prepare", "--apply"])
+
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "video.mp4").write_bytes(b"video")
+    index = tmp_path / "source-index.csv"
+    write_index(index, [renamer_row("video.mp4")])
+    output = tmp_path / "output"
+    assert renamer.main([str(root), str(index), str(output), "--prepare"]) == 0
+    assert renamer.main([str(root), str(index), str(output), "--prepare"]) == 2
+    assert "without an existing manifest" in capsys.readouterr().err
+
+
 def test_renamer_apply_writes_manifest_and_updated_index(tmp_path: Path):
     root = tmp_path / "source"
     root.mkdir()
@@ -520,6 +615,49 @@ def test_renamer_safe_move_never_overwrites_different_content(tmp_path: Path):
 
     assert source.read_bytes() == b"source"
     assert destination.read_bytes() == b"unrelated"
+
+
+def test_renamer_hash_tolerates_smb_bad_file_descriptor_on_close(
+    tmp_path: Path, monkeypatch
+):
+    media = tmp_path / "video.mp4"
+    media.touch()
+
+    class SmbReadableFile:
+        def __init__(self) -> None:
+            self.blocks = iter((b"video", b""))
+
+        def read(self, size: int) -> bytes:
+            return next(self.blocks)
+
+        def close(self) -> None:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+
+    monkeypatch.setattr(Path, "open", lambda self, mode: SmbReadableFile())
+
+    assert (
+        renamer.sha256_file(media)
+        == "0cab1c9617404faf2b24e221e189ca5945813e14d3f766345b09ca13bbe28ffc"
+    )
+
+
+def test_renamer_hash_preserves_read_errors_when_close_also_fails(
+    tmp_path: Path, monkeypatch
+):
+    media = tmp_path / "video.mp4"
+    media.touch()
+
+    class UnreadableFile:
+        def read(self, size: int) -> bytes:
+            raise OSError(errno.EIO, "input/output error")
+
+        def close(self) -> None:
+            raise OSError(errno.EBADF, "Bad file descriptor")
+
+    monkeypatch.setattr(Path, "open", lambda self, mode: UnreadableFile())
+
+    with pytest.raises(OSError, match="input/output error"):
+        renamer.sha256_file(media)
 
 
 def test_renamer_safe_move_refuses_a_destination_created_during_publication(

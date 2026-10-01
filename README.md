@@ -65,6 +65,18 @@ uv run dvr-timestamp-rename . video-timestamps.csv ../DVR-chronological
 
 The preview is read-only. It validates that the CSV contains exactly one row for
 every source MP4 and supported camera PNG, calculates SHA-256 checksums, and prints every proposed move.
+For a large or network-connected archive, prepare a reusable verified plan instead:
+
+```sh
+uv run dvr-timestamp-rename . video-timestamps.csv ../DVR-chronological --prepare
+```
+
+Preparation writes only `reorganization-manifest.csv` below the otherwise-empty
+destination root, including the calculated hashes and planned destinations. It
+prints sequential hash progress to stderr. Apply that prepared plan later with
+the normal command; it reuses the manifest instead of hashing the full archive
+again to build the plan. Each source is still hashed immediately before moving,
+so a file changed after preparation is rejected safely.
 Apply the reviewed plan explicitly:
 
 ```sh

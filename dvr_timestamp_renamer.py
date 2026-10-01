@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import errno
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -15,6 +17,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 from dvr_timestamp_indexer import (
     is_supported_media_path,
@@ -76,13 +79,70 @@ class Candidate:
         )
 
 
+class HashProgressReporter:
+    """Write synchronized, line-oriented media hashing updates to a text stream."""
+
+    def __init__(self, total: int, stream: io.TextIOBase | None = None) -> None:
+        self.total = total
+        self.stream = stream if stream is not None else sys.stderr
+        self._started = 0
+        self._completed = 0
+        self._lock = Lock()
+
+    def hashing(self, file_path: str) -> None:
+        """Report that hashing has begun for one media file."""
+        with self._lock:
+            self._started += 1
+            print(
+                f"hashing [{self._started}/{self.total}] {file_path}",
+                file=self.stream,
+                flush=True,
+            )
+
+    def hashed(self, file_path: str) -> None:
+        """Report that hashing completed for one media file."""
+        with self._lock:
+            self._completed += 1
+            print(
+                f"hashed [{self._completed}/{self.total}] {file_path}",
+                file=self.stream,
+                flush=True,
+            )
+
+
 def sha256_file(path: Path) -> str:
     """Return the SHA-256 digest of *path* without modifying it."""
     digest = hashlib.sha256()
-    with path.open("rb") as file:
+    file = path.open("rb")
+    try:
         for block in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(block)
+    except BaseException:
+        try:
+            file.close()
+        except OSError:
+            pass
+        raise
+    try:
+        file.close()
+    except OSError as exc:
+        if exc.errno != errno.EBADF:
+            raise
     return digest.hexdigest()
+
+
+def hash_paths(
+    paths: dict[str, Path], progress: HashProgressReporter | None = None
+) -> dict[str, str]:
+    """Hash media paths in deterministic order, optionally reporting progress."""
+    digests: dict[str, str] = {}
+    for name, path in sorted(paths.items()):
+        if progress:
+            progress.hashing(name)
+        digests[name] = sha256_file(path)
+        if progress:
+            progress.hashed(name)
+    return digests
 
 
 def parse_index_timestamp(value: str) -> datetime | None:
@@ -543,10 +603,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("input_root", type=Path, help="archive root used by the index")
     parser.add_argument("index_csv", type=Path, help="timestamp index CSV")
     parser.add_argument("output_root", type=Path, help="separate chronological archive")
-    parser.add_argument(
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
         "--apply",
         action="store_true",
         help="move files; without this flag, only print the complete plan",
+    )
+    action.add_argument(
+        "--prepare",
+        action="store_true",
+        help="write a verified planned manifest for a later --apply",
     )
     return parser
 
@@ -558,6 +624,10 @@ def main(argv: list[str] | None = None) -> int:
         rows = read_index(args.index_csv)
         manifest_path = output_root / MANIFEST_NAME
         resume = manifest_path.is_file()
+        if args.prepare and resume:
+            raise ValueError(
+                "prepare requires an output root without an existing manifest"
+            )
         if resume:
             moves = load_resume_plan(
                 input_root, output_root, rows, manifest_path
@@ -569,11 +639,21 @@ def main(argv: list[str] | None = None) -> int:
                     "a valid resume manifest"
                 )
             paths = validate_initial_archive(input_root, rows)
-            digests = {
-                name: sha256_file(path) for name, path in sorted(paths.items())
-            }
+            progress = None
+            if args.prepare:
+                print(
+                    f"preparing {len(paths)} media file(s) for hashing",
+                    file=sys.stderr,
+                )
+                progress = HashProgressReporter(len(paths))
+            digests = hash_paths(paths, progress)
             moves = build_plan(input_root, output_root, rows, digests)
+            if args.prepare:
+                write_manifest(manifest_path, moves)
         _print_plan(moves, resume=resume)
+        if args.prepare:
+            print(f"prepared {len(moves)} media file(s) at {manifest_path}")
+            return 0
         if not args.apply:
             return 0
         apply_plan(input_root, output_root, rows, moves)
